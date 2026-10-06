@@ -1,5 +1,5 @@
 /* Dompet Pensiun 55 — service worker: aplikasi tetap jalan offline */
-const VERSION = 'dp55-v1.0.1';
+const VERSION = 'dp55-v1.0.2';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './seed.json',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png', './icons/apple-touch-icon.png', './icons/favicon-32.png'];
 
