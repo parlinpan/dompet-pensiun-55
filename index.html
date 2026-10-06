@@ -105,6 +105,13 @@ main{max-width:1180px;margin:0 auto;padding-inline:16px;padding-block:18px 110px
 .btn.danger{color:var(--bad);border-color:var(--bad-soft)}
 .btn.sm{padding:5px 9px;font-size:12.5px}
 .btn:disabled{opacity:.5;cursor:not-allowed}
+.scanbox{display:flex;flex-direction:column;gap:10px;padding:12px;border:1px dashed var(--line);border-radius:10px;background:var(--surface-2)}
+.scan-row{display:flex;gap:12px;align-items:flex-start}
+.scan-thumb{width:96px;max-height:150px;object-fit:cover;object-position:top;border-radius:6px;border:1px solid var(--line);flex:none;background:var(--surface)}
+.scan-res{font-size:12.5px;padding:8px 10px;border-radius:8px;background:var(--good-soft)}
+.scan-res.warn{background:var(--warn-soft)}
+.ocr-text{white-space:pre-wrap;font-family:var(--font-num);font-size:11px;max-height:160px;overflow:auto;background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:8px;margin:6px 0 0}
+#scan-status .bar{margin-top:6px}
 .linkbtn{background:none;border:0;padding:2px 0;color:var(--accent);font-weight:600;cursor:pointer;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:3px;font-size:inherit}
 .linkbtn:hover{text-decoration-style:solid}
 .fab{position:fixed;right:16px;bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:30;box-shadow:0 6px 20px rgba(0,0,0,.18);padding:12px 18px;border-radius:999px;font-size:15px}
@@ -268,7 +275,7 @@ function lsGet(k){ try { return localStorage.getItem(k); } catch { return null; 
 function lsSet(k,v){ try { localStorage.setItem(k,v); } catch {} }
 
 /* ============ State & penyimpanan (lokal di perangkat) ============ */
-const DATA_KEY = 'dp55-data-v1', META_KEY = 'dp55-meta-v1', APP_VERSION = '1.1.0';
+const DATA_KEY = 'dp55-data-v1', META_KEY = 'dp55-meta-v1', APP_VERSION = '1.2.0';
 const DEFAULT_PROFILE = {retireAge:55, lifeExpectancy:80, emergencyMonths:6, stepUp:5, risk:'Moderat'};
 const S = { profile:{...DEFAULT_PROFILE}, budget:{}, accounts:[], assets:[], goals:[], months:{} };
 let MODE = 'loading', STORAGE_OK = true, TAB = (location.hash||'').slice(1) || lsGet('dp55-tab') || 'ringkasan';
@@ -481,6 +488,7 @@ function cashflowChart(){
   const first = keys.findIndex(k => S.months[k]?.items?.length);
   const ks = first < 0 ? keys.slice(-6) : keys.slice(Math.min(first, 6));
   const data = ks.map(k => ({k, ...monthStats(k)}));
+  if (!data.some(d => d.income || d.expense)) return '<div class="empty">Belum ada data arus kas. Grafik muncul setelah Anda mencatat transaksi.</div>';
   const W = 640, H = 220, L = 52, R = 8, T = 10, B = 26;
   const max = niceMax(Math.max(1, ...data.map(d => Math.max(d.income, d.expense))));
   const iw = W - L - R, ih = H - T - B, slot = iw / data.length, bw = Math.min(18, slot * 0.32);
@@ -522,6 +530,194 @@ function allocBar(weights){
   return `<div class="alloc">${GROUPS.map(([k,l,c]) => weights[k] > 0 ? `<span style="width:${weights[k]}%;background:${c}" title="${esc(l)} ${weights[k].toFixed(0)}%"></span>` : '').join('')}</div>`;
 }
 
+
+
+/* ============ Foto struk: penyimpanan (IndexedDB) ============ */
+const idb = (() => {
+  let p;
+  const open = () => p || (p = new Promise((res, rej) => { const r = indexedDB.open('dp55', 1); r.onupgradeneeded = () => r.result.createObjectStore('receipts'); r.onsuccess = () => res(r.result); r.onerror = () => { p = null; rej(r.error); }; }));
+  const run = (mode, fn) => open().then(db => new Promise((res, rej) => { const t = db.transaction('receipts', mode); const r = fn(t.objectStore('receipts')); t.oncomplete = () => res(r && r.result); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error); }));
+  return {
+    get: k => run('readonly', s => s.get(k)), set: (k, v) => run('readwrite', s => s.put(v, k)), del: k => run('readwrite', s => s.delete(k)), clear: () => run('readwrite', s => s.clear()),
+    all: () => open().then(db => new Promise(res => { const out = {}; const c = db.transaction('receipts').objectStore('receipts').openCursor(); c.onsuccess = () => { const cur = c.result; if (cur){ out[cur.key] = cur.value; cur.continue(); } else res(out); }; c.onerror = () => res(out); }))
+  };
+})();
+
+/* ============ Foto struk: OCR di perangkat (Tesseract.js) ============ */
+const OCR_VER = '7.0.0';
+let ocrWorkerP = null, ocrProgress = null;
+function loadScript(src){ return new Promise((res, rej) => { if (window.Tesseract) return res(); const s = document.createElement('script'); s.src = src; s.async = true; s.onload = res; s.onerror = () => rej(new Error('script')); document.head.appendChild(s); }); }
+function getOcr(){
+  if (!ocrWorkerP) ocrWorkerP = (async () => {
+    const L = window.OCR_LOCAL;   // hanya untuk pengujian
+    await loadScript(L ? L.script : `https://cdn.jsdelivr.net/npm/tesseract.js@${OCR_VER}/dist/tesseract.min.js`);
+    const opts = {logger: m => ocrProgress && ocrProgress(m)};
+    if (L){ opts.workerPath = L.worker; opts.corePath = L.core; opts.langPath = L.lang; }
+    const w = await Tesseract.createWorker(['ind','eng'], 1, opts);
+    await w.setParameters({preserve_interword_spaces: '1'});
+    return w;
+  })().catch(e => { ocrWorkerP = null; throw e; });
+  return ocrWorkerP;
+}
+async function loadImage(file){
+  const url = URL.createObjectURL(file);
+  try { const img = new Image(); img.decoding = 'async'; img.src = url; await img.decode(); return img; }
+  finally { setTimeout(() => URL.revokeObjectURL(url), 2000); }
+}
+function drawScaled(img, max){
+  const k = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+  const c = document.createElement('canvas'); c.width = Math.round(img.naturalWidth * k); c.height = Math.round(img.naturalHeight * k);
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); return c;
+}
+function prepForOcr(img){
+  // perbesar struk kecil, ubah ke abu-abu dan tarik kontras
+  const max = Math.max(img.naturalWidth, img.naturalHeight), target = clamp(max, 1400, 2200);
+  const k = target / max, c = document.createElement('canvas'); c.width = Math.round(img.naturalWidth * k); c.height = Math.round(img.naturalHeight * k);
+  const x = c.getContext('2d', {willReadFrequently: true}); x.drawImage(img, 0, 0, c.width, c.height);
+  const d = x.getImageData(0, 0, c.width, c.height), a = d.data; let lo = 255, hi = 0; const g = new Uint8ClampedArray(a.length / 4);
+  for (let i = 0, j = 0; i < a.length; i += 4, j++){ const v = (a[i]*0.299 + a[i+1]*0.587 + a[i+2]*0.114) | 0; g[j] = v; if (v < lo) lo = v; if (v > hi) hi = v; }
+  const span = Math.max(1, hi - lo);
+  for (let i = 0, j = 0; i < a.length; i += 4, j++){ const v = clamp((g[j] - lo) * 255 / span, 0, 255); a[i] = a[i+1] = a[i+2] = v; }
+  x.putImageData(d, 0, 0); return c;
+}
+
+/* Pembaca teks struk/bukti transfer → {amount, date, type, cat, merchant} */
+const MONTH_MAP = {jan:1, feb:2, mar:3, apr:4, mei:5, may:5, jun:6, jul:7, agu:8, agt:8, aug:8, ags:8, sep:9, okt:10, oct:10, nov:11, nop:11, des:12, dec:12};
+function parseIdrTokens(line){
+  const out = [];
+  const clean = line.replace(/(\d)[oO](?=\d|\b)/g, (m0, d) => d + '0').replace(/(\d)[lI](?=\d)/g, (m0, d) => d + '1');
+  const re = /(?:rp\.?|idr)?\s*(\d{1,3}(?:[.,\s]\d{3})+(?:[.,]\d{1,2})?|\d{4,10}(?:[.,]\d{1,2})?)(?!\d)/gi;
+  let m; while ((m = re.exec(clean))){
+    let t = m[1].replace(/\s/g, '');
+    const dec = t.match(/[.,](\d{1,2})$/); if (dec && /[.,]\d{3}[.,]\d{1,2}$|^\d+[.,]\d{1,2}$/.test(t)) t = t.slice(0, -dec[0].length);
+    const v = parseInt(t.replace(/[.,]/g, ''), 10);
+    if (v >= 100 && v < 1e11) out.push({v, rp: /rp|idr/i.test(m[0])});
+  }
+  return out;
+}
+function parseDate(text){
+  const today = new Date(); const ok = (y, mo, d) => { if (y < 100) y += 2000; if (mo < 1 || mo > 12 || d < 1 || d > 31) return null; const dt = new Date(y, mo-1, d); if (dt.getMonth() !== mo-1) return null; const diff = (today - dt) / 864e5; return diff > -2 && diff < 800 ? `${y}-${pad(mo)}-${pad(d)}` : null; };
+  let m;
+  const r1 = /(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})/g; while ((m = r1.exec(text))){ const v = ok(+m[1], +m[2], +m[3]); if (v) return v; }
+  const r2 = /(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/g; while ((m = r2.exec(text))){ let d = +m[1], mo = +m[2]; if (mo > 12 && d <= 12){ const t = d; d = mo; mo = t; } const v = ok(+m[3], mo, d); if (v) return v; }
+  const r3 = /(\d{1,2})\s*[-\s]?\s*(jan|feb|mar|apr|mei|may|jun|jul|agu|agt|ags|aug|sep|okt|oct|nov|nop|des|dec)[a-z]*\.?\s*[-\s]?\s*(\d{2,4})/gi; while ((m = r3.exec(text))){ const v = ok(+m[3], MONTH_MAP[m[2].toLowerCase().slice(0,3)], +m[1]); if (v) return v; }
+  return null;
+}
+const CAT_RULES = [
+  [/gaji|payroll|salary|thr\b/i, 'in', 'Gaji'],
+  [/dividen|bunga\s*(tabungan|deposito)|interest/i, 'in', 'Bunga/Dividen'],
+  [/indomaret|alfamart|alfamidi|superindo|hypermart|transmart|carrefour|lotte\s*mart|giant|hero|ranch\s*market|farmers|grand\s*lucky|tip\s*top|lulu|supermarket|minimarket|toserba/i, 'out', 'Belanja Rumah Tangga'],
+  [/resto|restoran|rumah\s*makan|warung|cafe|caf[eé]|kopi|coffee|bakery|bakmi|mie|sate|ayam|pizza|burger|kfc|mcdonald|mcd|starbucks|j\.?co|hokben|solaria|gofood|grabfood|shopeefood|makan|food|kitchen|bistro|dimsum/i, 'out', 'Makan & Minum'],
+  [/pertamina|spbu|shell|bp\s*akr|vivo|bbm|pertalite|pertamax|solar|tol\b|e-?toll|parkir|parking|gojek|goride|gocar|grab(?!food)|bluebird|taxi|taksi|krl|mrt|lrt|transjakarta|kai\b|tiket\s*kereta|garuda|lion\s*air|citilink|batik\s*air|super\s*air\s*jet/i, 'out', 'Transportasi'],
+  [/pln|listrik|token|pdam|air\s*minum|telkom|indihome|biznet|first\s*media|myrepublic|pulsa|paket\s*data|telkomsel|xl\b|indosat|im3|tri\b|smartfren|internet|wifi/i, 'out', 'Tagihan & Utilitas'],
+  [/apotek|apotik|kimia\s*farma|k-?24|century|guardian|watsons|klinik|rumah\s*sakit|\brs\b|hospital|dokter|lab(oratorium)?|prodia|bpjs\s*kes|asuransi|premi|obat/i, 'out', 'Kesehatan & Asuransi'],
+  [/sekolah|spp|kursus|les\b|universitas|kampus|uang\s*kuliah|ukt|buku|gramedia|pendidikan/i, 'out', 'Pendidikan'],
+  [/cicilan|angsuran|kartu\s*kredit|credit\s*card|kpr|pinjaman|paylater|kredivo|akulaku/i, 'out', 'Cicilan/Utang'],
+  [/zakat|infaq|infak|sedekah|donasi|baznas|kitabisa|gereja|masjid|perpuluhan|kolekte/i, 'out', 'Keluarga & Sosial/Zakat'],
+  [/xxi|cgv|cinepolis|bioskop|netflix|spotify|disney|youtube|game|steam|playstation|hotel|tiket\.com|traveloka|wisata|karaoke|gym|fitness/i, 'out', 'Hiburan & Gaya Hidup'],
+  [/sewa|kost|kos\b|ipl|maintenance\s*fee|iuran\s*lingkungan/i, 'out', 'Rumah/Sewa/KPR']
+];
+function parseReceipt(raw){
+  const text = raw.replace(/\r/g, '');
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const low = text.toLowerCase();
+  const isTransfer = /transfer|bukti\s*(transaksi|pembayaran)|rekening\s*tujuan|penerima|beneficiary|no\.?\s*ref|referensi|bi-?fast|qris|virtual\s*account|m-?banking|livin|brimo|bca\s*mobile|mybca|jenius|jago|seabank|blu\b|ovo|gopay|dana\b|shopeepay/i.test(low);
+  const incoming = /(dana|uang|transfer|saldo)\s*masuk|diterima\s*dari|terima\s*(uang|dana)?\s*dari|anda\s*menerima|you\s*received|incoming|transfer\s*masuk|kredit\s*masuk/i.test(low);
+  // nominal
+  const STRONG = /grand\s*total|total\s*(bayar|belanja|pembayaran|tagihan|harga|transaksi|transfer|akhir|amount)|jumlah\s*(transfer|pembayaran|bayar|dana|tagihan|uang)|nominal(\s*transfer)?|total\s*debet|amount\s*paid|total\s*due/i;
+  const MED = /\btotal\b|\bjumlah\b|\bbayar\b|dibayar|\bamount\b|\btagihan\b|\bharga\b/i;
+  const NEG = /sub\s*-?\s*total|tunai|\bcash\b|kembali|kembalian|change|diskon|disc\b|discount|hemat|potongan|ppn|pajak|\btax\b|\bdpp\b|poin|point|saldo|biaya\s*admin|admin|\bfee\b|\bqty\b|kartu\s*no|no\.?\s*(rek|kartu|ref)|npwp|telp|phone|member/i;
+  let best = null;
+  lines.forEach((ln, i) => {
+    const sc = STRONG.test(ln) ? 3 : MED.test(ln) ? 2 : 0;
+    if (!sc || (NEG.test(ln) && !STRONG.test(ln))) return;
+    let toks = parseIdrTokens(ln.replace(/\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}|\d{1,2}:\d{2}(:\d{2})?/g, ' '));
+    if (!toks.length && lines[i+1]) toks = parseIdrTokens(lines[i+1]);
+    if (!toks.length) return;
+    const v = Math.max(...toks.map(t => t.v));
+    if (!best || sc > best.sc || (sc === best.sc && v >= best.v)) best = {v, sc};
+  });
+  if (!best){
+    const all = lines.filter(l => !NEG.test(l) && !/\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}|\d{2}:\d{2}/.test(l)).flatMap(l => parseIdrTokens(l));
+    const rp = all.filter(t => t.rp), pool = rp.length ? rp : all;
+    if (pool.length) best = {v: Math.max(...pool.map(t => t.v)), sc: 0};
+  }
+  // pihak lawan / nama toko
+  let merchant = '';
+  if (isTransfer){
+    const named = v => v && (v.match(/[a-z]/gi) || []).length >= 3 && !/^\d|rekening|tujuan|nominal|jumlah/i.test(v);
+    for (const re of [/nama\s*penerima|penerima|kepada|beneficiary|diterima\s*dari|terima\s*dari|pengirim|dari\s*:/i, /nama\s*rek|tujuan|\bke\b/i]){
+      for (let i = 0; i < lines.length && !merchant; i++){ if (!re.test(lines[i])) continue;
+        const after = lines[i].split(/[:]/).slice(1).join(':').trim();
+        const cand = [after, lines[i+1], lines[i+2]].find(named);
+        if (cand) merchant = cand.replace(/[^A-Za-z0-9 .,&'-]/g, '').trim(); }
+      if (merchant) break;
+    }
+  }
+  if (!merchant){
+    merchant = (lines.slice(0, 6).find(l => { const letters = (l.match(/[a-z]/gi) || []).length; return letters >= 3 && letters / l.length > 0.55 && !/struk|receipt|nota|invoice|faktur|jl\.|jalan|telp|npwp|tanggal|kasir|cashier|selamat|welcome|terima\s*kasih|bukti|transfer|berhasil|sukses|success/i.test(l); }) || '').replace(/[^A-Za-z0-9 .,&'-]/g, '').trim();
+  }
+  merchant = merchant.slice(0, 40);
+  // jenis & kategori
+  let type = incoming ? 'in' : 'out', cat = null;
+  for (const [re, ty, c] of CAT_RULES){ if (re.test(low)){ if (ty === 'in'){ type = 'in'; cat = c; break; } if (type === 'out'){ cat = c; break; } } }
+  if (!cat) cat = type === 'in' ? 'Lainnya' : 'Lainnya';
+  return {amount: best ? best.v : null, date: parseDate(text), type, cat, merchant, isTransfer, confident: !!best && best.sc >= 2};
+}
+
+/* Tampilan scan di formulir transaksi */
+function scanTop(d, isNew, tx){
+  const thumb = d._thumb ? `<img src="${d._thumb}" alt="Foto struk" class="scan-thumb">` : (tx && tx.receipt ? `<img alt="Foto struk" class="scan-thumb" data-receipt="${tx.id}">` : '');
+  const res = d._scan ? `<div class="scan-res ${d._scan.ok ? 'ok' : 'warn'}">${d._scan.msg}</div>` : '';
+  const btns = isNew ? `<div class="row"><button type="button" class="btn" id="scan-cam">${ICON_CAM} Foto struk / bukti transfer</button><button type="button" class="btn" id="scan-file">${ICON_FILE} Pilih file</button></div>
+      <input type="file" id="scan-in-cam" accept="image/*" capture="environment" hidden><input type="file" id="scan-in-file" accept="image/*" hidden>` : '';
+  if (!btns && !thumb) return '';
+  return `<div class="full scanbox">${btns}<div id="scan-status" aria-live="polite"></div>${thumb || res ? `<div class="scan-row">${thumb}<div class="stack" style="gap:6px;min-width:0">${res}${d._ocr ? `<details><summary class="small" style="cursor:pointer">Teks yang terbaca</summary><pre class="ocr-text">${esc(d._ocr)}</pre></details>` : ''}</div></div>` : ''}</div>`;
+}
+const ICON_CAM = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 8h3l2-3h8l2 3h3v11H3z"/><circle cx="12" cy="13" r="4"/></svg>';
+const ICON_FILE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 16l4-4 3 3 5-6 4 5"/><rect x="3" y="4" width="18" height="16" rx="2"/></svg>';
+function wireScan(form, collect, reopen, tx, preset){
+  form.querySelectorAll('img[data-receipt]').forEach(img => idb.get(img.dataset.receipt).then(u => { if (u) img.src = u; else img.remove(); }).catch(() => img.remove()));
+  const cam = form.querySelector('#scan-in-cam'), fil = form.querySelector('#scan-in-file');
+  if (!cam) return;
+  form.querySelector('#scan-cam').onclick = () => cam.click();
+  form.querySelector('#scan-file').onclick = () => fil.click();
+  const go = async inp => {
+    const f = inp.files && inp.files[0]; if (!f) return;
+    const st = form.querySelector('#scan-status');
+    const show = (msg, p) => { st.innerHTML = `<div class="small">${msg}</div>${p != null ? `<div class="bar"><i style="width:${Math.round(p*100)}%"></i></div>` : ''}`; };
+    form.querySelectorAll('#scan-cam,#scan-file,button[type=submit]').forEach(b => b.disabled = true);
+    try {
+      show('Menyiapkan foto…', 0.02);
+      const img = await loadImage(f);
+      const thumb = drawScaled(img, 1000).toDataURL('image/jpeg', 0.72);
+      const prepared = prepForOcr(img);
+      ocrProgress = m => {
+        if (m.status === 'recognizing text') show('Membaca teks struk…', 0.35 + m.progress * 0.65);
+        else if (/load|initializ/i.test(m.status)) show('Menyiapkan pembaca teks' + (ocrWorkerP && !window.Tesseract ? '' : '') + '… (pertama kali butuh internet, ±8 MB)', 0.05 + (m.progress || 0) * 0.3);
+      };
+      const w = await getOcr();
+      const {data} = await w.recognize(prepared);
+      const r = parseReceipt(data.text || '');
+      const cur = collect(), next = {...cur, _thumb: thumb, _ocr: (data.text || '').trim()};
+      const found = [];
+      if (r.amount){ next.amount = r.amount; found.push('nominal ' + rp(r.amount)); }
+      if (r.date){ next.date = r.date; found.push('tanggal ' + new Date(r.date + 'T00:00').toLocaleDateString('id-ID',{day:'numeric', month:'short', year:'numeric'})); }
+      next.type = r.type; next.cat = r.cat;
+      found.push((r.type === 'in' ? 'pemasukan' : 'pengeluaran') + ' · ' + r.cat);
+      if (r.merchant && !cur.note) next.note = (r.isTransfer ? (r.type === 'in' ? 'Transfer dari ' : 'Transfer ke ') : '') + r.merchant;
+      next._scan = r.amount
+        ? {ok: r.confident, msg: `<b>Terbaca:</b> ${found.join(' · ')}. ${r.confident ? 'Periksa sekilas lalu tekan <b>Simpan</b>.' : '<b>Nominal kurang yakin</b>, cocokkan dengan struk sebelum Simpan.'}`}
+        : {ok: false, msg: '<b>Nominal tidak terbaca.</b> Foto lebih dekat, lurus dan terang, atau ketik nominalnya. Foto tetap dilampirkan.'};
+      reopen(next);
+    } catch (e){
+      show(navigator.onLine === false && !ocrWorkerP ? 'Pembaca teks belum terunduh. Sambungkan internet sekali untuk scan pertama.' : 'Gagal membaca foto. Coba foto lain atau isi manual.', null);
+      form.querySelectorAll('#scan-cam,#scan-file,button[type=submit]').forEach(b => b.disabled = false);
+    } finally { ocrProgress = null; inp.value = ''; }
+  };
+  cam.onchange = () => go(cam); fil.onchange = () => go(fil);
+  if (preset && preset._autoscan === 'cam') cam.click();
+}
 
 /* ============ Harian ============ */
 function daysIn(k){ const [y,m] = k.split('-').map(Number); return new Date(y, m, 0).getDate(); }
@@ -588,7 +784,7 @@ function todayPanel(){
   const m7 = Math.max(1, ...days.map(x => x.out), al ? al.perDay : 0);
   const sisa = al ? al.perDay - td.out : null;
   const TL = {in:'Masuk', out:'Keluar', tr:'Transfer', inv:'Investasi'};
-  return `<section class="panel"><div class="panel-head"><h2>Hari ini · ${d0.toLocaleDateString('id-ID',{weekday:'long', day:'numeric', month:'long'})}</h2><button class="btn sm primary" data-action="tx-new">＋ Catat</button></div>
+  return `<section class="panel"><div class="panel-head"><h2>Hari ini · ${d0.toLocaleDateString('id-ID',{weekday:'long', day:'numeric', month:'long'})}</h2><div class="row"><button class="btn sm" data-action="scan-new">${ICON_CAM} Scan struk</button><button class="btn sm primary" data-action="tx-new">＋ Catat</button></div></div>
     <div class="grid g3">
       <div class="stack" style="gap:2px"><span class="small muted">Keluar hari ini</span><b class="num neg" style="font-size:20px">${rp(td.out)}</b>${al ? `<span class="small ${sisa >= 0 ? 'pos' : 'neg'}">${sisa >= 0 ? 'sisa jatah ' + rp(sisa) : 'lewat jatah ' + rp(-sisa)}</span>` : '<span class="small muted">isi anggaran untuk jatah harian</span>'}</div>
       <div class="stack" style="gap:2px"><span class="small muted">Masuk hari ini</span><b class="num pos" style="font-size:20px">${rp(td.in)}</b><span class="small muted">${td.in ? 'tercatat' : 'belum ada pemasukan'}</span></div>
@@ -706,7 +902,7 @@ function vTransaksi(){
     const where = t.type === 'tr' ? `${esc(accN[t.acc]||'?')} → ${esc(accN[t.to]||'?')}` : t.type === 'inv' ? `${esc(accN[t.acc]||'?')} → ${esc(asN[t.asset]||'aset')}` : esc(accN[t.acc] || '–');
     const sign = t.type === 'in' ? '+' : t.type === 'out' ? '−' : '';
     rows += `<tr><td><span class="chip ${TL[t.type][1]}">${TL[t.type][0]}</span></td>
-      <td>${esc(t.type==='tr' ? 'Pindah dana' : t.type==='inv' ? 'Setor investasi' : t.cat)}${exTag(t)}${t.note ? `<div class="small muted">${esc(t.note)}</div>` : ''}</td>
+      <td>${esc(t.type==='tr' ? 'Pindah dana' : t.type==='inv' ? 'Setor investasi' : t.cat)}${exTag(t)}${t.receipt ? ' <span class="chip" title="Ada foto struk">struk</span>' : ''}${t.note ? `<div class="small muted">${esc(t.note)}</div>` : ''}</td>
       <td class="small muted">${where}</td>
       <td class="r num ${t.type==='in'?'pos':t.type==='out'?'neg':''}">${sign}${rp(t.amount)}</td>
       <td class="r" style="white-space:nowrap"><button class="btn ghost sm" data-action="tx-edit" data-id="${t.id}" data-m="${txMonth}">Ubah</button></td></tr>`;
@@ -932,7 +1128,8 @@ function vProfil(){
 
 /* ============ Modal / formulir ============ */
 const dlg = $('#dlg');
-function openForm({title, fields, data = {}, onSave, onDelete, saveLabel = 'Simpan'}){
+function openForm(args){
+  const {title, fields, data = {}, onSave, onDelete, saveLabel = 'Simpan', top, onMount} = args;
   const fieldHtml = fields.map(fd => {
     if (fd.hidden && fd.hidden(data)) return '';
     const v = data[fd.k] ?? fd.def ?? '';
@@ -943,17 +1140,18 @@ function openForm({title, fields, data = {}, onSave, onDelete, saveLabel = 'Simp
     return `<label class="f ${cls}">${fd.l}<input class="in" name="${fd.k}" id="f-${fd.k}" type="${fd.type||'text'}" ${fd.type==='number'?'step="any"':''} value="${esc(v)}" ${fd.ph?`placeholder="${esc(fd.ph)}"`:''}></label>`;
   }).join('');
   dlg.innerHTML = `<form class="dlg" method="dialog" id="dform"><div class="dlg-head"><h2>${esc(title)}</h2><button type="button" class="btn ghost" data-close aria-label="Tutup">✕</button></div>
-    <div class="dlg-body">${fieldHtml}</div>
+    <div class="dlg-body">${top ? (typeof top === 'function' ? top(data) : top) : ''}${fieldHtml}</div>
     <div class="dlg-foot"><div>${onDelete ? '<button type="button" class="btn danger" id="d-del">Hapus</button>' : ''}</div><div class="row"><button type="button" class="btn" data-close>Batal</button><button type="submit" class="btn primary">${saveLabel}</button></div></div></form>`;
   const form = $('#dform');
   const collect = () => { const o = {...data}; for (const fd of fields){ const el = form.elements[fd.k]; if (el) o[fd.k] = fd.type === 'money' ? num(el.value) : fd.type === 'number' ? num(el.value) : el.value; } return o; };
-  form.querySelectorAll('[data-seg]').forEach(btn => btn.onclick = () => { const o = collect(); o[btn.dataset.seg] = btn.dataset.v; openForm({title, fields, data:o, onSave, onDelete, saveLabel}); });
+  form.querySelectorAll('[data-seg]').forEach(btn => btn.onclick = () => { const o = collect(); o[btn.dataset.seg] = btn.dataset.v; openForm({...args, data:o}); });
   form.querySelectorAll('input[inputmode="numeric"]').forEach(moneyInput);
   form.querySelectorAll('[data-close]').forEach(b => b.onclick = () => dlg.close());
   form.onsubmit = e => { e.preventDefault(); const err = onSave(collect()); if (err){ toast(err); return; } dlg.close(); };
   if (onDelete){ const del = $('#d-del'); del.onclick = () => { if (del.dataset.armed){ onDelete(); dlg.close(); } else { del.dataset.armed = 1; del.textContent = 'Yakin hapus?'; } }; }
   if (!dlg.open) dlg.showModal();
-  const first = form.querySelector('[name="amount"]') || form.querySelector('input,select'); if (first) first.focus();
+  if (onMount) onMount(form, collect, d => openForm({...args, data:d}));
+  const first = form.querySelector('[name="amount"]') || form.querySelector('input:not([type=file]),select'); if (first && !args.noFocus) first.focus();
 }
 function moneyInput(el){
   el.addEventListener('input', () => { const raw = el.value.replace(/[^\d]/g,''); const pos = el.value.length - el.selectionStart; el.value = raw ? nf.format(+raw) : ''; const np = Math.max(0, el.value.length - pos); try { el.setSelectionRange(np, np); } catch {} });
@@ -976,6 +1174,9 @@ function txForm(tx, preset){
       {k:'asset', l:'Ke aset/investasi', type:'select', opts: () => assetsOnly().length ? assetsOnly().map(a => [a.id, a.name]) : [['','— tambah aset dulu di tab Rekening & Aset —']], hidden: d => d.type !== 'inv'},
       {k:'note', l:'Catatan (opsional)', full:true, ph:'mis. belanja bulanan, bayar listrik'}
     ],
+    top: d => scanTop(d, isNew, tx),
+    noFocus: !!(preset && preset._autoscan),
+    onMount: (form, collect, reopen) => wireScan(form, collect, reopen, tx, preset),
     onDelete: isNew ? null : () => saveTx(null, tx),
     onSave: d => {
       if (!(num(d.amount) > 0)) return 'Isi jumlah lebih dari 0.';
@@ -986,11 +1187,14 @@ function txForm(tx, preset){
       if (d.type === 'in' || d.type === 'out') t.cat = d.cat || (d.type === 'in' ? INC_CATS[0] : 'Lainnya');
       if (d.type === 'tr') t.to = d.to;
       if (d.type === 'inv') t.asset = d.asset;
-      saveTx(t, tx); toast(isNew ? 'Transaksi dicatat' : 'Transaksi diperbarui');
+      if (d._thumb){ t.receipt = true; idb.set(t.id, d._thumb).catch(() => toast('Foto struk tidak tersimpan (memori penuh).')); }
+      else if (tx?.receipt) t.receipt = true;
+      saveTx(t, tx); toast(isNew ? (d._thumb ? 'Transaksi dari struk dicatat' : 'Transaksi dicatat') : 'Transaksi diperbarui');
     }
   });
 }
 function saveTx(t, old){
+  if (old && !t && old.receipt) idb.del(old.id).catch(() => {});
   // efek ke aset (setor investasi menambah nilai & modal aset)
   const bump = (tx, sign) => { if (!tx || tx.type !== 'inv') return; const a = S.assets.find(x => x.id === tx.asset); if (!a) return;
     put('assets/' + a.id, {...a, value: num(a.value) + sign*num(tx.amount), cost: num(a.cost) + sign*num(tx.amount)}); };
@@ -1099,6 +1303,7 @@ document.addEventListener('click', e => {
   const act = a.dataset.action, id = a.dataset.id;
   switch (act){
     case 'tx-new': txForm(); break;
+    case 'scan-new': txForm(null, {_autoscan:'cam'}); break;
     case 'cat-tx': catTxDialog(a.dataset.cat, a.dataset.m); break;
     case 'cat-tx-new': txForm(null, {cat: a.dataset.cat}); break;
     case 'tx-edit': { const tx = (S.months[a.dataset.m]?.items || []).find(x => x.id === id); if (tx) txForm(tx); break; }
@@ -1159,7 +1364,8 @@ async function exportCsv(){
 }
 async function backup(){
   saveNow();
-  const ok = await fileDownload(`backup-dompet-pensiun-${todayStr()}.json`, JSON.stringify(snapshot(), null, 1), 'application/json');
+  const snap = snapshot(); snap.receipts = await idb.all().catch(() => ({}));
+  const ok = await fileDownload(`backup-dompet-pensiun-${todayStr()}.json`, JSON.stringify(snap), 'application/json');
   if (ok){ META.lastBackup = Date.now(); saveMeta(); toast('Backup dibuat'); render(); }
 }
 function restorePick(){ const inp = $('#restore-file'); if (!inp) return; inp.value = ''; inp.onchange = () => { const f = inp.files[0]; if (f) readBackup(f); }; inp.click(); }
@@ -1172,7 +1378,7 @@ function readBackup(f){
     const box = $('#restore-confirm');
     box.innerHTML = `<div class="banner warn"><div class="grow">Backup tanggal <b>${esc(new Date(d.savedAt).toLocaleString('id-ID'))}</b>: ${(d.accounts||[]).length} rekening, ${(d.assets||[]).length} aset/utang, ${n} transaksi. Memulihkan akan <b>mengganti semua data</b> di perangkat ini.</div><button class="btn sm danger" id="restore-yes">Ganti dengan backup</button><button class="btn sm" id="restore-no">Batal</button></div>`;
     $('#restore-no').onclick = () => box.innerHTML = '';
-    $('#restore-yes').onclick = () => { loadInto(d); saveNow(); toast('Data dipulihkan'); setTab('ringkasan'); };
+    $('#restore-yes').onclick = async () => { loadInto(d); saveNow(); if (d.receipts && typeof d.receipts === 'object'){ await idb.clear().catch(() => {}); for (const [k, v] of Object.entries(d.receipts)) if (typeof v === 'string' && v.startsWith('data:image/')) await idb.set(k, v).catch(() => {}); } toast('Data dipulihkan'); setTab('ringkasan'); };
   };
   r.readAsText(f);
 }
@@ -1192,7 +1398,7 @@ async function loadExamples(){
 }
 function wipe(btn){
   if (!btn.dataset.armed){ btn.dataset.armed = 1; btn.textContent = 'Klik lagi: hapus permanen'; return; }
-  loadInto({profile:{...DEFAULT_PROFILE}}); saveNow(); toast('Semua data dihapus'); setTab('ringkasan');
+  loadInto({profile:{...DEFAULT_PROFILE}}); saveNow(); idb.clear().catch(() => {}); toast('Semua data dihapus'); setTab('ringkasan');
 }
 
 /* ============ Install & backup banner ============ */
