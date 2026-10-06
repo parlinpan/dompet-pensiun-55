@@ -122,6 +122,7 @@ table{border-collapse:collapse;width:100%;font-size:13.5px}
 th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);white-space:nowrap}
 td{padding:9px 6px;border-bottom:1px solid var(--line);vertical-align:middle}
 td.r,th.r{text-align:right}
+td.num{white-space:nowrap}
 tr.day td{background:var(--surface-2);font-size:12px;font-weight:700;color:var(--muted);padding:6px}
 .chip{display:inline-block;font-size:11px;font-weight:700;padding:2px 7px;border-radius:5px;background:var(--surface-2);color:var(--muted);white-space:nowrap}
 .chip.in{background:var(--good-soft);color:var(--good)}
@@ -267,7 +268,7 @@ function lsGet(k){ try { return localStorage.getItem(k); } catch { return null; 
 function lsSet(k,v){ try { localStorage.setItem(k,v); } catch {} }
 
 /* ============ State & penyimpanan (lokal di perangkat) ============ */
-const DATA_KEY = 'dp55-data-v1', META_KEY = 'dp55-meta-v1', APP_VERSION = '1.0.2';
+const DATA_KEY = 'dp55-data-v1', META_KEY = 'dp55-meta-v1', APP_VERSION = '1.1.0';
 const DEFAULT_PROFILE = {retireAge:55, lifeExpectancy:80, emergencyMonths:6, stepUp:5, risk:'Moderat'};
 const S = { profile:{...DEFAULT_PROFILE}, budget:{}, accounts:[], assets:[], goals:[], months:{} };
 let MODE = 'loading', STORAGE_OK = true, TAB = (location.hash||'').slice(1) || lsGet('dp55-tab') || 'ringkasan';
@@ -521,8 +522,93 @@ function allocBar(weights){
   return `<div class="alloc">${GROUPS.map(([k,l,c]) => weights[k] > 0 ? `<span style="width:${weights[k]}%;background:${c}" title="${esc(l)} ${weights[k].toFixed(0)}%"></span>` : '').join('')}</div>`;
 }
 
+
+/* ============ Harian ============ */
+function daysIn(k){ const [y,m] = k.split('-').map(Number); return new Date(y, m, 0).getDate(); }
+function dayStats(k){
+  const arr = Array.from({length: daysIn(k)}, (_, i) => ({d:i+1, in:0, out:0, inv:0, n:0}));
+  for (const t of S.months[k]?.items || []){ const i = +t.date.slice(8) - 1; if (!arr[i]) continue; const v = num(t.amount);
+    if (t.type === 'in') arr[i].in += v; else if (t.type === 'out') arr[i].out += v; else if (t.type === 'inv') arr[i].inv += v; arr[i].n++; }
+  return arr;
+}
+function dailyAllowance(k = curMonth()){
+  const tot = sum(EXP_CATS, c => S.budget.cats?.[c]) || avgExpense(); if (!tot) return null;
+  const n = daysIn(k), ds = dayStats(k), isCur = k === curMonth();
+  if (!isCur) return {budget: tot, perDay: tot / n, cur:false};
+  const today = +todayStr().slice(8), left = n - today + 1;
+  const spentBefore = sum(ds.slice(0, today - 1), x => x.out);
+  return {budget: tot, perDay: Math.max(0, tot - spentBefore) / left, left, remaining: tot - spentBefore - ds[today-1].out, cur:true, today};
+}
+function dailyChart(k){
+  const ds = dayStats(k), al = dailyAllowance(k), n = ds.length, isCur = k === curMonth(), today = isCur ? +todayStr().slice(8) : 0;
+  const mw = ($('#main')?.clientWidth || 700) - 66, W = Math.round(clamp(mw, 300, 1100)), H = W < 500 ? 190 : 230, L = 52, Rr = 8, T = 22, B = 24, iw = W - L - Rr, ih = H - T - B;
+  const max = niceMax(Math.max(1, ...ds.map(x => x.out), al ? al.perDay * 1.1 : 0));
+  const slot = iw / n, bw = Math.max(3, slot * 0.62), y = v => T + ih - v / max * ih;
+  let g = '';
+  for (let i = 0; i <= 4; i++){ const v = max*i/4, yy = y(v); g += `<line class="grid-l" x1="${L}" x2="${W-Rr}" y1="${yy}" y2="${yy}"/><text x="${L-6}" y="${yy+3.5}" text-anchor="end">${esc(rpc(v).replace('Rp ',''))}</text>`; }
+  ds.forEach((x, i) => {
+    const cx = L + slot*i + slot/2, over = al && x.out > al.perDay;
+    if (x.out > 0) g += `<rect x="${(cx-bw/2).toFixed(1)}" y="${y(x.out).toFixed(1)}" width="${bw.toFixed(1)}" height="${(T+ih-y(x.out)).toFixed(1)}" rx="1.5" fill="${over ? 'var(--c-out)' : 'var(--c-fi)'}"><title>${x.d} ${monthLabel(k)}: keluar ${rp(x.out)}${x.in ? ' · masuk ' + rp(x.in) : ''}</title></rect>`;
+    if (x.in > 0) g += `<circle cx="${cx.toFixed(1)}" cy="${T-10}" r="4.5" fill="var(--c-in)"><title>${x.d} ${monthLabel(k)}: masuk ${rp(x.in)}</title></circle>`;
+    if (x.d === 1 || x.d % 5 === 0 || x.d === n) g += `<text x="${cx.toFixed(1)}" y="${H-7}" text-anchor="middle"${x.d === today ? ' style="fill:var(--ink);font-weight:700"' : ''}>${x.d}</text>`;
+    if (x.d === today) g += `<rect x="${(cx-slot/2).toFixed(1)}" y="${T}" width="${slot.toFixed(1)}" height="${ih}" fill="var(--accent)" opacity=".08"/>`;
+  });
+  if (al){ const yy = y(al.perDay); g += `<line x1="${L}" x2="${W-Rr}" y1="${yy}" y2="${yy}" stroke="var(--warn)" stroke-dasharray="5 4" stroke-width="1.4"/><text x="${W-Rr}" y="${yy-4}" text-anchor="end" style="fill:var(--warn);font-weight:600">jatah ${esc(rpc(al.perDay))}/hari</text>`; }
+  return `<div class="chart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Pengeluaran dan pemasukan per hari">${g}</svg></div>
+  <div class="legend"><span><i style="background:var(--c-fi)"></i>Keluar ≤ jatah</span><span><i style="background:var(--c-out)"></i>Keluar &gt; jatah</span><span><i style="background:var(--c-in);border-radius:50%"></i>Ada pemasukan</span>${al ? '<span><i style="background:var(--warn)"></i>Jatah belanja per hari</span>' : ''}</div>`;
+}
+function dailyPanel(k){
+  const ds = dayStats(k), isCur = k === curMonth(), upto = isCur ? +todayStr().slice(8) : ds.length;
+  const passed = ds.slice(0, upto), spent = sum(passed, x => x.out), income = sum(passed, x => x.in);
+  const avg = upto ? spent / upto : 0, top = passed.reduce((a, x) => x.out > (a?.out || 0) ? x : a, null), zero = passed.filter(x => x.out === 0).length;
+  const al = dailyAllowance(k);
+  const rows = ds.filter(x => x.n).slice().reverse().map(x => `<tr><td>${new Date(k + '-' + pad(x.d) + 'T00:00').toLocaleDateString('id-ID',{weekday:'short', day:'numeric', month:'short'})}</td><td class="r num pos">${x.in ? '+' + rp(x.in) : ''}</td><td class="r num neg">${x.out ? '−' + rp(x.out) : ''}</td><td class="r num">${x.inv ? rp(x.inv) : ''}</td><td class="r num ${x.in - x.out >= 0 ? 'pos' : 'neg'}">${(x.in - x.out >= 0 ? '+' : '−') + rp(Math.abs(x.in - x.out))}</td></tr>`).join('');
+  return `<section class="panel"><div class="panel-head"><h2>Harian · ${monthLabel(k)}</h2><span class="hint">batang merah = melewati jatah harian</span></div>
+    <div class="grid g4">
+      <div class="stack" style="gap:2px"><span class="small muted">Rata-rata keluar/hari</span><b class="num">${rp(avg)}</b></div>
+      <div class="stack" style="gap:2px"><span class="small muted">Hari terboros</span><b class="num">${top ? top.d + ' ' + MONTHS_ID[+k.slice(5)-1] + ' · ' + rpc(top.out) : '–'}</b></div>
+      <div class="stack" style="gap:2px"><span class="small muted">Hari tanpa belanja</span><b class="num">${zero} dari ${upto} hari</b></div>
+      <div class="stack" style="gap:2px"><span class="small muted">${al && al.cur ? 'Jatah belanja/hari (sisa ' + al.left + ' hari)' : 'Rata-rata anggaran/hari'}</span><b class="num">${al ? rp(al.perDay) : 'isi anggaran'}</b></div>
+    </div>
+    ${dailyChart(k)}
+    <details><summary class="small" style="cursor:pointer;font-weight:600">Tabel per hari (${ds.filter(x => x.n).length} hari ada transaksi)</summary>
+      ${rows ? `<div class="tbl-wrap"><table><thead><tr><th>Tanggal</th><th class="r">Masuk</th><th class="r">Keluar</th><th class="r">Investasi</th><th class="r">Selisih</th></tr></thead><tbody>${rows}
+      <tr><td><b>Total</b></td><td class="r num pos"><b>+${rp(sum(ds, x => x.in))}</b></td><td class="r num neg"><b>−${rp(sum(ds, x => x.out))}</b></td><td class="r num"><b>${rp(sum(ds, x => x.inv))}</b></td><td></td></tr></tbody></table></div>` : '<p class="muted small">Belum ada transaksi.</p>'}
+    </details></section>`;
+}
+function todayPanel(){
+  const t = todayStr(), cm = curMonth(), ds = dayStats(cm), td = ds[+t.slice(8)-1], al = dailyAllowance(cm);
+  const items = (S.months[cm]?.items || []).filter(x => x.date === t).sort((a,b) => (b.ts||0) - (a.ts||0));
+  const accN = Object.fromEntries(S.accounts.map(a => [a.id, a.name]));
+  // 7 hari terakhir (lintas bulan)
+  const days = []; const d0 = new Date(t + 'T00:00');
+  for (let i = 6; i >= 0; i--){ const d = new Date(d0); d.setDate(d.getDate() - i); const ds2 = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+    const its = (S.months[ds2.slice(0,7)]?.items || []).filter(x => x.date === ds2);
+    days.push({ds:ds2, d, out: sum(its.filter(x => x.type === 'out'), x => x.amount), in: sum(its.filter(x => x.type === 'in'), x => x.amount)}); }
+  const m7 = Math.max(1, ...days.map(x => x.out), al ? al.perDay : 0);
+  const sisa = al ? al.perDay - td.out : null;
+  const TL = {in:'Masuk', out:'Keluar', tr:'Transfer', inv:'Investasi'};
+  return `<section class="panel"><div class="panel-head"><h2>Hari ini · ${d0.toLocaleDateString('id-ID',{weekday:'long', day:'numeric', month:'long'})}</h2><button class="btn sm primary" data-action="tx-new">＋ Catat</button></div>
+    <div class="grid g3">
+      <div class="stack" style="gap:2px"><span class="small muted">Keluar hari ini</span><b class="num neg" style="font-size:20px">${rp(td.out)}</b>${al ? `<span class="small ${sisa >= 0 ? 'pos' : 'neg'}">${sisa >= 0 ? 'sisa jatah ' + rp(sisa) : 'lewat jatah ' + rp(-sisa)}</span>` : '<span class="small muted">isi anggaran untuk jatah harian</span>'}</div>
+      <div class="stack" style="gap:2px"><span class="small muted">Masuk hari ini</span><b class="num pos" style="font-size:20px">${rp(td.in)}</b><span class="small muted">${td.in ? 'tercatat' : 'belum ada pemasukan'}</span></div>
+      <div class="stack" style="gap:2px"><span class="small muted">Jatah belanja per hari</span><b class="num" style="font-size:20px">${al ? rp(al.perDay) : '–'}</b><span class="small muted">${al ? `sisa anggaran ${rpc(Math.max(0, al.remaining))} untuk ${al.left} hari` : ''}</span></div>
+    </div>
+    <div><div class="small muted" style="margin-bottom:6px">7 hari terakhir (pengeluaran)</div>
+      <div style="display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px;align-items:end;height:84px">
+        ${days.map(x => `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;height:100%;justify-content:flex-end" title="${esc(x.d.toLocaleDateString('id-ID'))}: keluar ${rp(x.out)}${x.in ? ', masuk ' + rp(x.in) : ''}">
+          <span class="num" style="font-size:10px;color:var(--muted)">${x.out ? rpc(x.out).replace('Rp ','') : ''}</span>
+          <div style="width:100%;max-width:28px;border-radius:3px;height:${Math.max(2, x.out / m7 * 48)}px;background:${al && x.out > al.perDay ? 'var(--c-out)' : 'var(--c-fi)'}"></div>
+          <span style="font-size:11px;${x.ds === t ? 'font-weight:700;color:var(--ink)' : 'color:var(--muted)'}">${x.d.toLocaleDateString('id-ID',{weekday:'short'})}${x.in ? ' <span style="color:var(--c-in)">●</span>' : ''}</span></div>`).join('')}
+      </div></div>
+    ${items.length ? `<div class="tbl-wrap"><table><tbody>${items.map(x => `<tr><td><span class="chip ${x.type}">${TL[x.type]}</span></td><td>${esc(x.type === 'out' || x.type === 'in' ? x.cat : x.type === 'tr' ? 'Pindah dana' : 'Setor investasi')}${x.note ? `<div class="small muted">${esc(x.note)}</div>` : ''}</td><td class="small muted">${esc(accN[x.acc] || '')}</td><td class="r num ${x.type === 'in' ? 'pos' : x.type === 'out' ? 'neg' : ''}">${x.type === 'in' ? '+' : x.type === 'out' ? '−' : ''}${rp(x.amount)}</td><td class="r"><button class="btn ghost sm" data-action="tx-edit" data-id="${x.id}" data-m="${cm}">Ubah</button></td></tr>`).join('')}</tbody></table></div>`
+      : '<p class="small muted" style="margin:0">Belum ada transaksi hari ini.</p>'}
+  </section>`;
+}
+
 /* ============ Render ============ */
-let renderPending = false, deferUntilBlur = false;
+let renderPending = false, deferUntilBlur = false, lastW = innerWidth;
+window.addEventListener('resize', () => { if (Math.abs(innerWidth - lastW) > 40){ lastW = innerWidth; scheduleRender(); } });
 function scheduleRender(){ if (renderPending) return; renderPending = true; requestAnimationFrame(() => { renderPending = false; render(); }); }
 document.addEventListener('focusout', () => { if (deferUntilBlur){ deferUntilBlur = false; setTimeout(scheduleRender, 0); } });
 
@@ -566,6 +652,7 @@ function vRingkasan(){
     ${kpi('Dana darurat', emM == null ? rpc(em) : emM.toLocaleString('id-ID',{maximumFractionDigits:1}) + ' bln', `${rpc(em)} · target ${num(S.profile.emergencyMonths||6)} bln`, emM == null ? '' : emM >= num(S.profile.emergencyMonths||6) ? 'pos' : emM < 3 ? 'neg' : '')}
     ${retireKpi}
   </div>`;
+  h += todayPanel();
   const adv = advisories();
   h += `<div class="grid g2">
     <section class="panel"><div class="panel-head"><h2>Arus kas bulanan</h2><span class="hint">rasio menabung ${monthLabel(cm)}: ${pct(st.rate)}</span></div>${cashflowChart()}</section>
@@ -614,8 +701,8 @@ function vTransaksi(){
   const TL = {in:['Masuk','in'], out:['Keluar','out'], tr:['Transfer','tr'], inv:['Investasi','inv']};
   let rows = '', day = '';
   for (const t of list){
-    if (t.date !== day){ day = t.date; const d = new Date(day + 'T00:00'); const dayTotal = sum(list.filter(x => x.date === day && x.type === 'out'), x => x.amount);
-      rows += `<tr class="day"><td colspan="4">${d.toLocaleDateString('id-ID',{weekday:'long', day:'numeric', month:'long'})}</td><td class="r num">${dayTotal ? '−' + rpc(dayTotal) : ''}</td></tr>`; }
+    if (t.date !== day){ day = t.date; const d = new Date(day + 'T00:00'); const dayOut = sum(items.filter(x => x.date === day && x.type === 'out'), x => x.amount), dayIn = sum(items.filter(x => x.date === day && x.type === 'in'), x => x.amount);
+      rows += `<tr class="day"><td colspan="3">${d.toLocaleDateString('id-ID',{weekday:'long', day:'numeric', month:'long'})}</td><td class="r num" colspan="2">${dayIn ? '<span class="pos">+' + rpc(dayIn) + '</span>' : ''}${dayIn && dayOut ? ' · ' : ''}${dayOut ? '<span class="neg">−' + rpc(dayOut) + '</span>' : ''}</td></tr>`; }
     const where = t.type === 'tr' ? `${esc(accN[t.acc]||'?')} → ${esc(accN[t.to]||'?')}` : t.type === 'inv' ? `${esc(accN[t.acc]||'?')} → ${esc(asN[t.asset]||'aset')}` : esc(accN[t.acc] || '–');
     const sign = t.type === 'in' ? '+' : t.type === 'out' ? '−' : '';
     rows += `<tr><td><span class="chip ${TL[t.type][1]}">${TL[t.type][0]}</span></td>
@@ -630,6 +717,7 @@ function vTransaksi(){
     ${kpi('Disetor ke investasi', rpc(st.inv), `pindah ke tabungan ${rpc(st.saveTr)}`)}
     ${kpi('Sisa / rasio menabung', (st.net>=0?'+':'') + rpc(st.net), pct(st.rate) + ' dari pemasukan', st.net>=0?'pos':'neg')}
   </div>
+  ${dailyPanel(txMonth)}
   <section class="panel">
     <div class="panel-head">${monthNav(txMonth,'tx-month')}
       <div class="row">
