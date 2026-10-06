@@ -265,7 +265,7 @@ function lsGet(k){ try { return localStorage.getItem(k); } catch { return null; 
 function lsSet(k,v){ try { localStorage.setItem(k,v); } catch {} }
 
 /* ============ State & penyimpanan (lokal di perangkat) ============ */
-const DATA_KEY = 'dp55-data-v1', META_KEY = 'dp55-meta-v1', APP_VERSION = '1.0.0';
+const DATA_KEY = 'dp55-data-v1', META_KEY = 'dp55-meta-v1', APP_VERSION = '1.0.1';
 const DEFAULT_PROFILE = {retireAge:55, lifeExpectancy:80, emergencyMonths:6, stepUp:5, risk:'Moderat'};
 const S = { profile:{...DEFAULT_PROFILE}, budget:{}, accounts:[], assets:[], goals:[], months:{} };
 let MODE = 'loading', STORAGE_OK = true, TAB = (location.hash||'').slice(1) || lsGet('dp55-tab') || 'ringkasan';
@@ -294,8 +294,8 @@ function saveNow(){
 }
 function persist(){ clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 250); }
 function saveMeta(){ lsSet(META_KEY, JSON.stringify(META)); }
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && saveTimer) saveNow(); });
-window.addEventListener('pagehide', () => { if (saveTimer) saveNow(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden'){ flushBinds(); if (saveTimer) saveNow(); } });
+window.addEventListener('pagehide', () => { flushBinds(); if (saveTimer) saveNow(); });
 function put(path, data){
   const clean = data ? JSON.parse(JSON.stringify(data)) : null;
   if (clean) delete clean.id;
@@ -819,7 +819,8 @@ function vProfil(){
     ${f('Kenaikan setoran/tahun (%)','stepUp', p.stepUp ?? 5,'num')}
     <label class="f">Profil risiko<select class="in" data-bind="profile.risk">${['Konservatif','Moderat','Agresif'].map(r => `<option ${ (p.risk||'Moderat') === r ? 'selected':''}>${r}</option>`).join('')}</select></label>
   </div>
-  <p class="note">Tersimpan otomatis saat Anda pindah kolom. Usia sekarang: <b>${age() ?? '–'}</b>. Target dana darurat 6 bulan untuk pegawai dengan tanggungan; 9–12 bulan bila penghasilan tidak tetap.</p>
+  <div class="row"><button class="btn primary" data-action="save-profile">Simpan profil</button><span class="small pos" id="save-note" aria-live="polite"></span></div>
+  <p class="note">Tersimpan otomatis saat Anda mengetik. Usia sekarang: <b>${age() ?? '–'}</b>. Target dana darurat 6 bulan untuk pegawai dengan tanggungan; 9–12 bulan bila penghasilan tidak tetap.</p>
   </section>
   <section class="panel"><div class="panel-head"><h2>Backup &amp; pindah perangkat</h2><span class="hint">${META.lastBackup ? 'backup terakhir ' + new Date(META.lastBackup).toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'}) : 'belum pernah backup'}</span></div>
     <p class="small">Data tersimpan <b>hanya di perangkat ini</b>, tidak dikirim ke server mana pun. Untuk memakai data yang sama di Mac, iPhone dan Android: buat backup di sini, kirim filenya ke perangkat lain (AirDrop, email, Google Drive), lalu pulihkan di sana.</p>
@@ -956,18 +957,34 @@ function goalForm(g){
 
 /* ============ Binding input langsung (profil, anggaran) ============ */
 function setPath(obj, keys, val){ let o = obj; for (let i = 0; i < keys.length - 1; i++){ o[keys[i]] = (o[keys[i]] && typeof o[keys[i]] === 'object') ? {...o[keys[i]]} : {}; o = o[keys[i]]; } o[keys[keys.length-1]] = val; }
+/* Simpan kolom profil/anggaran: otomatis saat mengetik (jeda 0,4 dtk), saat pindah kolom, dan saat app ditutup */
+const bindTimers = new Map();
+function saveBind(el, quiet){
+  clearTimeout(bindTimers.get(el)); bindTimers.delete(el);
+  const bind = el.dataset && el.dataset.bind; if (!bind) return false;
+  const [root, ...keys] = bind.split('.');
+  const numeric = el.inputMode === 'numeric' || el.getAttribute('inputmode') === 'numeric';
+  const val = numeric ? num(el.value) : el.value;
+  const doc = JSON.parse(JSON.stringify(S[root] || {}));
+  let cur = doc; for (const k of keys.slice(0,-1)) cur = cur && cur[k];
+  if (cur && cur[keys[keys.length-1]] === val && !doc.example) return false;
+  setPath(doc, keys, val);
+  delete doc.example;            // data yang Anda ubah bukan lagi contoh
+  put('settings/' + root, doc);
+  const note = $('#save-note'); if (note) note.textContent = 'Tersimpan ' + new Date().toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  return true;
+}
+function flushBinds(){ for (const el of [...bindTimers.keys()]) saveBind(el, true); }
 document.addEventListener('change', e => {
   const el = e.target;
   if (el.id === 'txq'){ txFilter.q = el.value; render(); return; }
-  const bind = el.dataset && el.dataset.bind; if (!bind) return;
-  const [root, ...keys] = bind.split('.');
-  const numeric = el.inputMode === 'numeric';
-  const val = numeric ? num(el.value) : el.value;
-  const doc = JSON.parse(JSON.stringify(S[root] || {}));
-  setPath(doc, keys, val);
-  put('settings/' + root, doc);
+  if (el.dataset && el.dataset.bind) saveBind(el);
 });
-document.addEventListener('input', e => { if (e.target.dataset?.bind && e.target.inputMode === 'numeric') { /* format ribuan */ const el = e.target; const raw = el.value.replace(/[^\d]/g,''); if (raw.length > 4 && !/profile\.(birthYear|retireAge|lifeExpectancy|emergencyMonths|stepUp)/.test(el.dataset.bind)) el.value = nf.format(+raw); } });
+document.addEventListener('input', e => {
+  const el = e.target; if (!el.dataset || !el.dataset.bind) return;
+  if (el.getAttribute('inputmode') === 'numeric'){ const raw = el.value.replace(/[^\d]/g,''); if (raw.length > 4 && !/profile\.(birthYear|retireAge|lifeExpectancy|emergencyMonths|stepUp)/.test(el.dataset.bind)) el.value = nf.format(+raw); }
+  clearTimeout(bindTimers.get(el)); bindTimers.set(el, setTimeout(() => saveBind(el), 400));
+});
 document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'txq'){ txFilter.q = e.target.value; render(); } });
 
 /* ============ Aksi ============ */
@@ -993,6 +1010,7 @@ document.addEventListener('click', e => {
     case 'bud-auto': budAuto(); break;
     case 'export': exportCsv(); break;
     case 'clear-examples': clearExamples(a); break;
+    case 'save-profile': { document.querySelectorAll('[data-bind^="profile."]').forEach(el => saveBind(el)); saveNow(); if (document.activeElement) document.activeElement.blur(); toast('Profil tersimpan'); setTimeout(render, 50); break; }
     case 'backup': backup(); break;
     case 'restore': restorePick(); break;
     case 'load-examples': loadExamples(); break;
